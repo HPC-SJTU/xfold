@@ -2,8 +2,17 @@
 # Copyright 2024 xfold authors
 # Copyright 2024 DeepMind Technologies Limited
 #
-# AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
-# this license, visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+# AlphaFold 3 source code is licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
 # To request access to the AlphaFold 3 model parameters, follow the process set
 # out at https://github.com/google-deepmind/alphafold3. You may only use these
@@ -12,8 +21,8 @@
 
 """AlphaFold 3 structure prediction script.
 
-AlphaFold 3 source code is licensed under CC BY-NC-SA 4.0. To view a copy of
-this license, visit https://creativecommons.org/licenses/by-nc-sa/4.0/
+AlphaFold 3 source code is licensed under Apache License, Version 2.0. To view a
+copy of this license, visit http://www.apache.org/licenses/LICENSE-2.0
 
 To request access to the AlphaFold 3 model parameters, follow the process set
 out at https://github.com/google-deepmind/alphafold3. You may only use these
@@ -24,7 +33,9 @@ https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md
 import random
 from collections.abc import Sequence
 import csv
+import contextlib
 import dataclasses
+import functools
 import multiprocessing
 import os
 import pathlib
@@ -34,6 +45,9 @@ import sys
 import textwrap
 import time
 from typing import overload
+
+# OpenMP imports may narrow the main thread's affinity to a single core.
+_INITIAL_CPU_AFFINITY = os.sched_getaffinity(0)
 
 from absl import app
 from absl import flags
@@ -61,6 +75,7 @@ from af3_kernels.tools import DO_PROFILE, USE_DIST
 from xfold.alphafold3 import AlphaFold3
 from xfold.params import import_jax_weights_
 from xfold.fastnn import config as fastnn_config
+from xfold.preprocessing import load_intermediates, load_preprocessed_inputs
 
 _BUCKETS: tuple[int, ...] = (
     64,
@@ -126,6 +141,11 @@ _INPUT_DIR = flags.DEFINE_string(
     'input_dir',
     None,
     'Path to the directory containing input JSON files.',
+)
+_PREPROCESSED_DIR = flags.DEFINE_string(
+    'preprocessed_dir',
+    None,
+    'Root written by run_preprocessing.py in the separate AF3 3.0.4 environment.',
 )
 _OUTPUT_DIR = flags.DEFINE_string(
     'output_dir',
@@ -269,17 +289,24 @@ class ModelRunner:
         self._model_dir = model_dir
         self._device = device
 
-        self._model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
-        self._model.eval()
+    @functools.cached_property
+    def _model(self):
+        # Keep model/OpenMP initialization out of the external search stage.
+        model = AlphaFold3(num_samples=_NUM_DIFFUSION_SAMPLES.value)
+        model.eval()
         print('loading the model parameters...')
-        import_jax_weights_(self._model, model_dir)
+        import_jax_weights_(model, self._model_dir)
 
-        self._model = self._model.to(device=self._device)
+        model = model.to(device=self._device)
 
         if _USE_FASTNN.value is False:
             fastnn_config.layer_norm_implementation = 'torch'
             fastnn_config.dot_product_attention_implementation = 'torch'
             fastnn_config.gated_linear_unit_implementation = 'torch'
+        return model
+
+    def load_model(self):
+        return self._model
 
     @torch.inference_mode()
     def run_inference(
@@ -366,19 +393,24 @@ def predict_structure(
     fold_input: folding_input.Input,
     model_runner: ModelRunner,
     buckets: Sequence[int] | None = None,
+    featurised_examples: Sequence[features.BatchDict] | None = None,
 ) -> Sequence[ResultsForSeed]:
     """Runs the full inference pipeline to predict structures for each seed."""
 
-    print(f'Featurising data for seeds {fold_input.rng_seeds}...')
-    featurisation_start_time = time.time()
-    ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
-    featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
-    )
-    print(
-        f'Featurising data for seeds {fold_input.rng_seeds} took '
-        f' {time.time() - featurisation_start_time:.2f} seconds.'
-    )
+    if featurised_examples is None:
+        print(f'Featurising data for seeds {fold_input.rng_seeds}...')
+        featurisation_start_time = time.time()
+        ccd = chemical_components.cached_ccd(user_ccd=fold_input.user_ccd)
+        featurised_examples = featurisation.featurise_input(
+            fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=True
+        )
+        print(
+            f'Featurising data for seeds {fold_input.rng_seeds} took '
+            f' {time.time() - featurisation_start_time:.2f} seconds.'
+        )
+    elif len(featurised_examples) != len(fold_input.rng_seeds):
+        raise ValueError('The number of examples must match the number of seeds.')
+    model_runner.load_model()
     all_inference_start_time = time.time()
     all_inference_results = []
     for seed, example in zip(fold_input.rng_seeds, featurised_examples):
@@ -492,6 +524,16 @@ def write_outputs(
             writer.writerows(ranking_scores)
 
 
+@contextlib.contextmanager
+def _data_pipeline_affinity():
+    previous = os.sched_getaffinity(0)
+    os.sched_setaffinity(0, _INITIAL_CPU_AFFINITY)
+    try:
+        yield
+    finally:
+        os.sched_setaffinity(0, previous)
+
+
 @overload
 def process_fold_input(
     fold_input: folding_input.Input,
@@ -499,6 +541,7 @@ def process_fold_input(
     model_runner: None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    featurised_examples: Sequence[features.BatchDict] | None = None,
 ) -> folding_input.Input:
     ...
 
@@ -510,6 +553,7 @@ def process_fold_input(
     model_runner: ModelRunner,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    featurised_examples: Sequence[features.BatchDict] | None = None,
 ) -> Sequence[ResultsForSeed]:
     ...
 
@@ -520,6 +564,7 @@ def process_fold_input(
     model_runner: ModelRunner | None,
     output_dir: os.PathLike[str] | str,
     buckets: Sequence[int] | None = None,
+    featurised_examples: Sequence[features.BatchDict] | None = None,
 ) -> folding_input.Input | Sequence[ResultsForSeed]:
     """Runs data pipeline and/or inference on a single fold input.
 
@@ -534,6 +579,8 @@ def process_fold_input(
         number of tokens. If not None, must be a sequence of at least one integer,
         in strictly increasing order. Will raise an error if the number of tokens
         is more than the largest bucket size.
+      featurised_examples: Saved features from isolated preprocessing. These must
+        not be combined with a data pipeline config.
 
     Returns:
       The processed fold input, or the inference results for each seed.
@@ -545,13 +592,16 @@ def process_fold_input(
 
     if not fold_input.chains:
         raise ValueError('Fold input has no chains.')
+    if featurised_examples is not None and data_pipeline_config is not None:
+        raise ValueError('Saved features cannot be combined with the data pipeline.')
 
     if data_pipeline_config is None:
         print('Skipping data pipeline...')
     else:
         print('Running data pipeline...')
-        fold_input = pipeline.DataPipeline(
-            data_pipeline_config).process(fold_input)
+        with _data_pipeline_affinity():
+            fold_input = pipeline.DataPipeline(
+                data_pipeline_config).process(fold_input)
 
     print(f'Output directory: {output_dir}')
     print(f'Writing model input JSON to {output_dir}')
@@ -568,6 +618,7 @@ def process_fold_input(
             fold_input=fold_input,
             model_runner=model_runner,
             buckets=buckets,
+            featurised_examples=featurised_examples,
         )
 
         if rank != 0:
@@ -590,10 +641,14 @@ def process_fold_input(
 
 
 def main(_):
-    if _JSON_PATH.value is None == _INPUT_DIR.value is None:
+    if sum(value is not None for value in (
+        _JSON_PATH.value, _INPUT_DIR.value, _PREPROCESSED_DIR.value
+    )) != 1:
         raise ValueError(
-            'Exactly one of --json_path or --input_dir must be specified.'
+            'Exactly one of --json_path, --input_dir or --preprocessed_dir must be specified.'
         )
+    if _PREPROCESSED_DIR.value is not None and _RUN_DATA_PIPELINE.value:
+        raise ValueError('--preprocessed_dir requires --run_data_pipeline=False.')
 
     if not _RUN_INFERENCE.value and not _RUN_DATA_PIPELINE.value:
         raise ValueError(
@@ -601,7 +656,11 @@ def main(_):
             ' set to true.'
         )
 
-    if _INPUT_DIR.value is not None:
+    if _PREPROCESSED_DIR.value is not None:
+        fold_inputs = load_preprocessed_inputs(
+            pathlib.Path(_PREPROCESSED_DIR.value), folding_input.Input
+        )
+    elif _INPUT_DIR.value is not None:
         fold_inputs = folding_input.load_fold_inputs_from_dir(
             pathlib.Path(_INPUT_DIR.value)
         )
@@ -681,6 +740,13 @@ def main(_):
 
     print(f'Processing {len(fold_inputs)} fold inputs.')
     for fold_input in fold_inputs:
+        featurised_examples = None
+        if _PREPROCESSED_DIR.value is not None:
+            featurised_examples = load_intermediates(
+                fold_input.rng_seeds,
+                pathlib.Path(_PREPROCESSED_DIR.value)
+                / fold_input.sanitised_name() / 'intermediates',
+            )
         process_fold_input(
             fold_input=fold_input,
             data_pipeline_config=data_pipeline_config,
@@ -688,6 +754,7 @@ def main(_):
             output_dir=os.path.join(
                 _OUTPUT_DIR.value, fold_input.sanitised_name()),
             buckets=_BUCKETS,
+            featurised_examples=featurised_examples,
         )
     if USE_DIST:
         torch.distributed.barrier()

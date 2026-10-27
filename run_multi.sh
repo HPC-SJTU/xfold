@@ -1,15 +1,19 @@
 #!/bin/bash
 # This script is used to run AlphaFold on multiple nodes using MPI.
+set -o pipefail
 
-cd $(dirname $0)
-source scripts/env.sh || { \
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)" || exit 1
+source "$SCRIPT_DIR/scripts/env.sh" || { \
     echo 'Please place your `env.sh` under `scripts` directory.'; \
     echo 'You can refer to `env.sh.example` for the content of `env.sh`.'; \
     exit 1; \
 }
+cd -- "$SCRIPT_DIR" || exit 1
 
 INPUT_NAME=${1:-37aa_2JO9.json}
 HOSTS=${2:-}
+source "$SCRIPT_DIR/run_preprocessing.sh" || exit 1
+configure_preprocessed_input || exit 1
 
 if [ ${NNODES} -gt 1 ]; then
     MPIRUN_ARGS="-hosts ${HOSTS} -ppn ${PPN} -n ${NNODE_MPI}"
@@ -28,7 +32,7 @@ echo "Running AlphaFold on multi nodes for ${INPUT_NAME}, PPN=${PPN}, NNODES=${N
 
 time mpirun ${MPIRUN_ARGS} python run_alphafold.py \
     --run_data_pipeline=False \
-    --json_path=${JSON_PATH}/${INPUT_NAME} \
+    "${INPUT_ARGS[@]}" \
     --model_dir=${MODEL_DIR} \
     --output_dir=${OUTPUT_DIR} 2>&1 \
     | tee -a ${LOG_DIR}/${INPUT_NAME}.log
